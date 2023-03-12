@@ -1,6 +1,3 @@
-#![feature(path_try_exists)]
-#![feature(toowned_clone_into)]
-
 use clap::Parser;
 use flume::{self, select::Selector};
 use num_cpus;

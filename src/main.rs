@@ -55,11 +55,13 @@ async fn traverse(path: &Path) -> Result<(), Error> {
             .await
             .with_context(|| "stat failed")?
         {
-            process::Command::new(cmd[0])
+            return process::Command::new(cmd[0])
                 .args(&cmd[1..])
                 .current_dir(&path)
                 .status()
-                .await?;
+                .await
+                .map(|_| ())
+                .with_context(|| "exec failed");
         };
     }
 

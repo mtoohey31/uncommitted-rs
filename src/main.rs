@@ -4,7 +4,7 @@ use anyhow::{Context, Error};
 use async_recursion::async_recursion;
 use clap::Parser;
 use futures::future::join_all;
-use tokio::{fs as tfs, process};
+use tokio::{fs as tfs, process, task::JoinHandle};
 
 const GIT_DIR: &'static str = ".git";
 const HG_DIR: &'static str = ".hg";
@@ -33,19 +33,7 @@ async fn main() -> Result<(), Error> {
         .paths
         .into_iter()
         .map(|path| tokio::spawn(async move { traverse(&path).await }));
-    if let Some(e) =
-        join_all(handles)
-            .await
-            .into_iter()
-            .find_map(|r| match r.with_context(|| "join failed") {
-                Err(e) | Ok(Err(e)) => Some(e),
-                _ => None,
-            })
-    {
-        Err(e)
-    } else {
-        Ok(())
-    }
+    join_all_handles(handles).await
 }
 
 #[async_recursion]
@@ -87,17 +75,16 @@ async fn traverse(path: &Path) -> Result<(), Error> {
         handles.push(tokio::spawn(async move { traverse(&entry.path()).await }));
     }
 
-    if let Some(e) =
-        join_all(handles)
-            .await
-            .into_iter()
-            .find_map(|r| match r.with_context(|| "join failed") {
-                Err(e) | Ok(Err(e)) => Some(e),
-                _ => None,
-            })
-    {
-        Err(e)
-    } else {
-        Ok(())
-    }
+    join_all_handles(handles).await
+}
+
+async fn join_all_handles<I>(iter: I) -> Result<(), Error>
+where
+    I: IntoIterator<Item = JoinHandle<Result<(), Error>>>,
+{
+    join_all(iter)
+        .await
+        .into_iter()
+        .map(|res| res.with_context(|| "join failed")?)
+        .collect()
 }

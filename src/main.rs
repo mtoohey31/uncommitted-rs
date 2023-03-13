@@ -6,16 +6,14 @@ use clap::Parser;
 use futures::future::join_all;
 use tokio::{fs as tfs, process, task::JoinHandle};
 
-const GIT_DIR: &'static str = ".git";
-const HG_DIR: &'static str = ".hg";
-const SVN_DIR: &'static str = ".svn";
-
-const GIT_CMD: [&str; 5] = ["git", "-c", "color.status=always", "status", "-s"];
-const HG_CMD: [&str; 4] = ["hg", "--config", "extensions.color=!", "st"];
-const SVN_CMD: [&str; 3] = ["svn", "st", "-v"];
-
-const DIR_CMD_PAIRS: [(&str, &[&str]); 3] =
-    [(GIT_DIR, &GIT_CMD), (HG_DIR, &HG_CMD), (SVN_DIR, &SVN_CMD)];
+const DIR_CMD_PAIRS: [(&str, &[&str]); 3] = [
+    (
+        ".git",
+        &["git", "-c", "color.status=always", "status", "-s"],
+    ),
+    (".hg", &["hg", "--config", "extensions.color=!", "st"]),
+    (".svn", &["svn", "st", "-v"]),
+];
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]

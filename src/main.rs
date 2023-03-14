@@ -27,6 +27,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // TODO: figure out how to avoid hitting ulimit by checking it then using a semaphore; may
+    // require rewriting tfs::read_dir so we can prevent it from buffering ahead without us
+    // actually having aquired the necessary semaphores
     let handles = Args::parse()
         .paths
         .into_iter()

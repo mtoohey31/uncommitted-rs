@@ -1,21 +1,20 @@
-use std::{
-    io::{stderr, stdout, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
 use anyhow::{Context, Error};
 use clap::Parser;
 use futures::future::join_all;
-use tokio::{fs as tfs, process::Command, task::JoinHandle};
+use std::{
+    io::{stderr, stdout, Write},
+    path::{Path, PathBuf},
+};
+use tokio::{fs as tfs, process::Command, sync::mpsc, task::JoinHandle};
 
-struct VCSInfo<'a> {
-    name: &'a str,
-    dir: &'a str,
-    cmd: &'a [&'a str],
+#[derive(Debug)]
+struct VCSInfo {
+    name: &'static str,
+    dir: &'static str,
+    cmd: &'static [&'static str],
 }
 
-const DIR_CMD_PAIRS: [VCSInfo; 3] = [
+const VCS_INFO: &[VCSInfo; 3] = &[
     VCSInfo {
         name: "git",
         dir: ".git",
@@ -33,7 +32,7 @@ const DIR_CMD_PAIRS: [VCSInfo; 3] = [
     },
 ];
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
     #[clap(short = 'n', help = "Display number of modified repositories")]
@@ -48,89 +47,75 @@ async fn main() -> Result<(), Error> {
     // require rewriting tfs::read_dir so we can prevent it from buffering ahead without us
     // actually having aquired the necessary semaphores
 
-    async fn run<M: Mode>(mode: M, paths: Vec<PathBuf>) -> Result<(), Error> {
-        let handles = paths
-            .into_iter()
-            .map(|path| tokio::spawn(async move { traverse(mode, &path.canonicalize()?).await }));
-        join_all_handles(handles).await
-    }
-
     let args = Args::parse();
-    if args.count {
-        let mode = &*Box::leak(Box::new(CountMode::new()));
-        run(mode, args.paths).await?;
-        println!("{}", mode.0.load(Ordering::Acquire));
+
+    let (tx, mut rx) = mpsc::channel::<(PathBuf, &'static VCSInfo)>(8);
+    let receiver = if args.count {
+        tokio::spawn(async move {
+            let mut count = 0;
+            while let Some((path, VCSInfo { cmd, .. })) = rx.recv().await {
+                let output = Command::new(cmd[0])
+                    .args(&cmd[1..])
+                    .current_dir(&path)
+                    .output()
+                    .await?;
+
+                if output.stdout.len() + output.stderr.len() > 0 {
+                    count += 1;
+                }
+            }
+
+            println!("{count}");
+
+            Ok::<(), Error>(())
+        })
     } else {
-        run(OutputMode, args.paths).await?;
-    }
+        tokio::spawn(async move {
+            while let Some((path, VCSInfo { name, cmd, .. })) = rx.recv().await {
+                let output = Command::new(cmd[0])
+                    .args(&cmd[1..])
+                    .current_dir(&path)
+                    .output()
+                    .await
+                    .with_context(|| "exec failed")?;
+
+                if output.stdout.len() + output.stderr.len() > 0 {
+                    let mut stdout = stdout();
+                    let path = path.to_string_lossy();
+                    println!("{path} - {name}");
+                    stdout.write_all(&output.stdout)?;
+                    stderr().write_all(&output.stderr)?;
+                };
+            }
+
+            Ok::<(), Error>(())
+        })
+    };
+
+    let senders = args.paths.into_iter().map(|path| {
+        let tx = tx.clone();
+        tokio::spawn(async move { traverse(tx, &path.canonicalize()?).await })
+    });
+    join_all_handles(senders).await?;
+    drop(tx);
+
+    receiver.await??;
 
     Ok(())
 }
 
-#[async_trait::async_trait]
-trait Mode: Send + Sync + Copy + 'static {
-    async fn run(&self, path: &Path, cmd: &[&str], name: &str) -> Result<(), Error>;
-}
-
-struct CountMode(AtomicUsize);
-
-impl CountMode {
-    fn new() -> Self {
-        Self(AtomicUsize::new(0))
-    }
-}
-
-#[async_trait::async_trait]
-impl Mode for &'static CountMode {
-    async fn run(&self, path: &Path, cmd: &[&str], _name: &str) -> Result<(), Error> {
-        let output = Command::new(cmd[0])
-            .args(&cmd[1..])
-            .current_dir(&path)
-            .output()
-            .await?;
-
-        if output.stdout.len() + output.stderr.len() > 0 {
-            self.0.fetch_add(1, Ordering::Release);
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy)]
-struct OutputMode;
-
-#[async_trait::async_trait]
-impl Mode for OutputMode {
-    async fn run(&self, path: &Path, cmd: &[&str], name: &str) -> Result<(), Error> {
-        let output = Command::new(cmd[0])
-            .args(&cmd[1..])
-            .current_dir(&path)
-            .output()
-            .await
-            .with_context(|| "exec failed")?;
-
-        if output.stdout.len() + output.stderr.len() > 0 {
-            let mut stdout = stdout();
-            let path = path.to_string_lossy();
-            writeln!(&stdout, "{path} - {name}")?;
-            stdout.write_all(&output.stdout)?;
-            stderr().write_all(&output.stderr)?;
-        };
-
-        Ok(())
-    }
-}
-
 #[async_recursion::async_recursion]
-async fn traverse<M: Mode>(mode: M, path: &Path) -> Result<(), Error> {
-    for VCSInfo { name, dir, cmd } in DIR_CMD_PAIRS {
+async fn traverse(tx: mpsc::Sender<(PathBuf, &'static VCSInfo)>, path: &Path) -> Result<(), Error> {
+    for vcs_info @ VCSInfo { dir, .. } in VCS_INFO {
         if tfs::try_exists(path.join(dir))
             .await
             .with_context(|| "stat failed")?
         {
-            return mode.run(path, cmd, name).await;
-        };
+            tx.send((path.to_owned(), &vcs_info))
+                .await
+                .expect("channel shouldn't have been closed");
+            return Ok(());
+        }
     }
 
     let mut dir_entries = tfs::read_dir(path)
@@ -152,8 +137,9 @@ async fn traverse<M: Mode>(mode: M, path: &Path) -> Result<(), Error> {
             continue;
         }
 
+        let tx = tx.clone();
         handles.push(tokio::spawn(
-            async move { traverse(mode, &entry.path()).await },
+            async move { traverse(tx, &entry.path()).await },
         ));
     }
 
